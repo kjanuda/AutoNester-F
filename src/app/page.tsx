@@ -89,6 +89,26 @@ type ReplayReport = {
   total_runtime_ms: number;
   note: string;
 };
+type MaterialReview = {
+  schema: string; source_sha256: string; source_units: string;
+  manual_unit_override: boolean; pattern_count: number;
+  source_material_labels: {label:string; patterns:number; labelled_quantity:number; pattern_names:string[]}[];
+  reference_check: {status:string; candidate_mm?:number; independent_reference_mm?:number; absolute_difference_mm?:number};
+  issues: string[]; factory_cutting_approved: false;
+};
+type MaterialGroup = {
+  group_id:string; source_material_labels:string[]; fabric_width_mm:number;
+  fabric_length_mm:number; utilization_percent:number; waste_percent:number;
+  instances:number; geometry_audit:{passed:boolean; minimum_clearance_mm:number|null; layout_fingerprint:string};
+  layout:NestingResult; cutting_approved:false;
+};
+type MaterialPreview = {
+  schema:string; source_sha256:string; selected_pattern_types:number;
+  selected_instances:number; group_count:number; groups:MaterialGroup[];
+  warnings:string[]; production_approved:false;
+};
+type MaterialAssignment = {source_label:string; group_id:string; operator_confirmed:boolean};
+
 type PresetKey = "original" | "concave" | "rotation" | "optimization";
 type ActivePreset = PresetKey | "imported";
 type ImportInfo = {
@@ -301,7 +321,7 @@ const COLORS = ["#38bdf8", "#a78bfa", "#34d399", "#fbbf24", "#fb7185", "#2dd4bf"
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<"workspace"|"patterns"|"files"|"optimization"|"validation"|"exports">("workspace");
+  const [activeTab, setActiveTab] = useState<"workspace"|"patterns"|"files"|"materials"|"optimization"|"validation"|"exports">("workspace");
   const [expandedPattern, setExpandedPattern] = useState<string | null>(null);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   // UI-only viewer state; never modifies nested geometry or exported DXF.
@@ -341,6 +361,13 @@ export default function Home() {
   const [tukaReport, setTukaReport] = useState<TukaPreflight | null>(null);
   const [tukaLoading, setTukaLoading] = useState(false);
   const [tukaError, setTukaError] = useState("");
+  const [materialReview, setMaterialReview] = useState<MaterialReview | null>(null);
+  const [materialPreview, setMaterialPreview] = useState<MaterialPreview | null>(null);
+  const [materialAssignments, setMaterialAssignments] = useState<MaterialAssignment[]>([]);
+  const [materialWidths, setMaterialWidths] = useState<Record<string,string>>({});
+  const [materialLoading, setMaterialLoading] = useState(false);
+  const [materialError, setMaterialError] = useState("");
+  const [selectedMaterialGroup, setSelectedMaterialGroup] = useState("");
   const [cadMetadata, setCadMetadata] = useState<CadMetadataReview | null>(null);
   const [cadMetadataError, setCadMetadataError] = useState("");
   const [cadMetadataLoading, setCadMetadataLoading] = useState(false);
@@ -417,7 +444,7 @@ export default function Home() {
     const sample = PRESETS[next];
     setPreset(next);
     setImportInfo(null);
-    setSourceFile(null); setImportSettings(null); setCadReview(null); setCadReviewError(""); setCadMetadata(null); setCadMetadataError(""); setTukaReport(null); setTukaError("");
+    setSourceFile(null); setImportSettings(null); setCadReview(null); setCadReviewError(""); setCadMetadata(null); setCadMetadataError(""); setTukaReport(null); setTukaError(""); setMaterialReview(null); setMaterialPreview(null); setMaterialAssignments([]); setMaterialError("");
     setFabricMode("flat");
     setEnforceConstraints(false);
     setFabricWidth(sample.width);
@@ -433,7 +460,7 @@ export default function Home() {
     if (!file) return;
     setUploading(true);
     setError("");
-    setSourceFile(null); setImportSettings(null); setCadReview(null); setCadReviewError(""); setCadMetadata(null); setCadMetadataError(""); setTukaReport(null); setTukaError("");
+    setSourceFile(null); setImportSettings(null); setCadReview(null); setCadReviewError(""); setCadMetadata(null); setCadMetadataError(""); setTukaReport(null); setTukaError(""); setMaterialReview(null); setMaterialPreview(null); setMaterialAssignments([]); setMaterialError("");
     setReferenceMeasurement(""); setReferencePatternIndex(1);
     setComparison(null); setBenchmark(null); setRefinement(null); setPhase13Report(null);
     setSelectedTrial(null);
@@ -637,6 +664,67 @@ export default function Home() {
     }
   }
 
+  async function runMaterialReview() {
+    if (!sourceFile || !importSettings || !importInfo) return;
+    setMaterialLoading(true); setMaterialError(""); setMaterialPreview(null);
+    try {
+      const body = new FormData();
+      body.append("file", sourceFile);
+      body.append("unitless_units", importSettings.unitless);
+      body.append("source_units_override", importSettings.override);
+      const resp = await fetch(`${API_BASE}/api/cad/material-review`, {method:"POST", body});
+      const payload = await resp.json();
+      if (!resp.ok) throw new Error(typeof payload.detail === "string" ? payload.detail : "Material review failed");
+      const report = payload as MaterialReview;
+      if (report.source_sha256 !== importInfo.source_dxf_sha256) throw new Error("DXF checksum mismatch; import the original file again.");
+      setMaterialReview(report);
+      setMaterialAssignments(report.source_material_labels.map(item => ({source_label:item.label, group_id:"", operator_confirmed:false})));
+      setMaterialWidths({});
+    } catch (e) { setMaterialError(e instanceof Error ? e.message : "Material review failed."); }
+    finally { setMaterialLoading(false); }
+  }
+
+  async function generateMaterialPreviews() {
+    if (!sourceFile || !importSettings || !importInfo || !materialReview) return;
+    setMaterialLoading(true); setMaterialError(""); setMaterialPreview(null);
+    try {
+      const selectedLabels = new Set(patterns.map(piece => piece.source_material?.trim() || "UNLABELED"));
+      const selectedAssignments = materialAssignments.filter(item => selectedLabels.has(item.source_label));
+      if (selectedAssignments.some(a => !a.operator_confirmed || !a.group_id.trim()))
+        throw new Error("Confirm and name every selected material code using the original CAD before generating previews.");
+      const groupIds = new Set(selectedAssignments.map(a => a.group_id.trim()));
+      const widths:Record<string,number> = {};
+      for (const id of groupIds) {
+        const value = materialWidths[id]?.trim();
+        if (value) widths[id] = Number(value);
+      }
+      const form = new FormData();
+      form.append("file", sourceFile);
+      form.append("unitless_units", importSettings.unitless);
+      form.append("source_units_override", importSettings.override);
+      form.append("selected_patterns_json", JSON.stringify(patterns.map(p => ({name:p.name, quantity:p.quantity??1}))));
+      form.append("assignments_json", JSON.stringify(selectedAssignments.map(a => ({...a,group_id:a.group_id.trim()}))));
+      form.append("fabric_width",String(fabricWidth)); form.append("gap",String(gap));
+      form.append("group_widths_json",JSON.stringify(widths));
+      const resp = await fetch(`${API_BASE}/api/nesting/material-preview`, {method:"POST", body:form});
+      const payload = await resp.json();
+      if (!resp.ok) throw new Error(typeof payload.detail === "string" ? payload.detail : "Material grouping failed");
+      const report = payload as MaterialPreview;
+      if (report.source_sha256 !== importInfo.source_dxf_sha256) throw new Error("Source DXF changed since import.");
+      if (!report.groups.every(g => g.geometry_audit.passed)) throw new Error("A material geometry audit failed.");
+      setMaterialPreview(report); setSelectedMaterialGroup(report.groups[0]?.group_id??"");
+    } catch (e) { setMaterialError(e instanceof Error ? e.message : "Material preview failed."); }
+    finally { setMaterialLoading(false); }
+  }
+
+  function downloadMaterialReview() {
+    const report = materialPreview || materialReview;
+    if (!report) return;
+    const url = URL.createObjectURL(new Blob([JSON.stringify(report,null,2)],{type:"application/json"}));
+    const a = document.createElement("a"); a.href=url; a.download="AutoNester_Phase15_MATERIAL_PREVIEW_NOT_FOR_CUTTING.json";
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),1500);
+  }
+
   async function generateNesting() {
     setLoading(true);
     setError("");
@@ -834,6 +922,7 @@ export default function Home() {
   }
 
   function updateSelected(name: string, patch: Partial<Pattern>) {
+    setMaterialPreview(null);
     setPatterns((prev) => prev.map((p) => p.name === name ? { ...p, ...patch } : p));
     setResult(null);
     setComparison(null); setBenchmark(null); setRefinement(null); setPhase13Report(null);
@@ -841,6 +930,7 @@ export default function Home() {
   }
 
   function useCadQuantities() {
+    setMaterialPreview(null);
     setPatterns((prev) => prev.map((p) => ({
       ...p, quantity: Number.isInteger(p.source_quantity) && (p.source_quantity ?? 0) > 0
         ? Math.min(60, p.source_quantity!) : 1
@@ -955,19 +1045,20 @@ export default function Home() {
         <nav className="an-nav">          <button type="button" className={`an-nav-item ${activeTab === "workspace" ? "active" : ""}`} onClick={() => setActiveTab("workspace")} aria-current={activeTab === "workspace" ? "page" : undefined}><NavIcon name="layout"/><span>Workspace</span>{activeTab === "workspace" && <span className="an-nav-indicator"/>}</button>
           <button type="button" className={`an-nav-item ${activeTab === "patterns" ? "active" : ""}`} onClick={() => setActiveTab("patterns")} aria-current={activeTab === "patterns" ? "page" : undefined}><NavIcon name="grid"/><span>Patterns</span>{activeTab === "patterns" && <span className="an-nav-indicator"/>}</button>
           <button type="button" className={`an-nav-item ${activeTab === "files" ? "active" : ""}`} onClick={() => setActiveTab("files")} aria-current={activeTab === "files" ? "page" : undefined}><NavIcon name="file"/><span>CAD Files</span>{activeTab === "files" && <span className="an-nav-indicator"/>}</button>
+          <button type="button" className={`an-nav-item ${activeTab === "materials" ? "active" : ""}`} onClick={() => setActiveTab("materials")} aria-current={activeTab === "materials" ? "page" : undefined}><NavIcon name="layers"/><span>Materials</span>{activeTab === "materials" && <span className="an-nav-indicator"/>}</button>
           <button type="button" className={`an-nav-item ${activeTab === "optimization" ? "active" : ""}`} onClick={() => setActiveTab("optimization")} aria-current={activeTab === "optimization" ? "page" : undefined}><NavIcon name="spark"/><span>Optimization</span>{activeTab === "optimization" && <span className="an-nav-indicator"/>}</button>
           <button type="button" className={`an-nav-item ${activeTab === "validation" ? "active" : ""}`} onClick={() => setActiveTab("validation")} aria-current={activeTab === "validation" ? "page" : undefined}><NavIcon name="shield"/><span>Validation</span>{activeTab === "validation" && <span className="an-nav-indicator"/>}</button>
           <button type="button" className={`an-nav-item ${activeTab === "exports" ? "active" : ""}`} onClick={() => setActiveTab("exports")} aria-current={activeTab === "exports" ? "page" : undefined}><NavIcon name="download"/><span>Exports</span>{activeTab === "exports" && <span className="an-nav-indicator"/>}</button></nav>
-        <div className="an-sidebar-bottom"><span className="an-status-dot"/> Development preview <small>v0.14 · Not for cutting</small></div>
+        <div className="an-sidebar-bottom"><span className="an-status-dot"/> Development preview <small>v0.15 · Not for cutting</small></div>
       </aside>
       <div className="an-main">
         <header className="an-topbar">
-          <div className="min-w-0"><div className="an-breadcrumb">AutoNester <span> / </span> {activeTab === "files" ? "CAD Files" : activeTab === "patterns" ? "Patterns" : activeTab === "optimization" ? "Optimization" : activeTab === "validation" ? "Validation" : activeTab === "exports" ? "Exports" : "Workspace"}</div>
-            <h1>{activeTab === "files" ? "CAD file center" : activeTab === "patterns" ? "Pattern manager" : activeTab === "optimization" ? "Optimization lab" : activeTab === "validation" ? "Validation & audit" : activeTab === "exports" ? "Exports & reports" : "Nesting workspace"}</h1>
+          <div className="min-w-0"><div className="an-breadcrumb">AutoNester <span> / </span> {activeTab === "files" ? "CAD Files" : activeTab === "materials" ? "Materials" : activeTab === "patterns" ? "Patterns" : activeTab === "optimization" ? "Optimization" : activeTab === "validation" ? "Validation" : activeTab === "exports" ? "Exports" : "Workspace"}</div>
+            <h1>{activeTab === "files" ? "CAD file center" : activeTab === "materials" ? "Material-aware preview" : activeTab === "patterns" ? "Pattern manager" : activeTab === "optimization" ? "Optimization lab" : activeTab === "validation" ? "Validation & audit" : activeTab === "exports" ? "Exports & reports" : "Nesting workspace"}</h1>
             <p className="an-top-subtitle">{preset === "imported" ? importInfo?.file_name : PRESETS[preset].label} <span className="px-2">·</span> {pieceCount} selected instances</p>
           </div>
           <div className="an-top-actions">
-            <span className="an-version">Prototype v0.14</span>
+            <span className="an-version">Prototype v0.15</span>
             <button type="button" className="an-outline-action" onClick={() => setActiveTab("files")}><NavIcon name="file"/> Import DXF</button>
             <button type="button" className="an-primary-action" onClick={async () => {setActiveTab("workspace"); await generateNesting();}} disabled={loading || patterns.length===0 || fabricWidth<=0 || gap<0}><NavIcon name="spark"/> {loading ? "Working..." : "Generate Nesting"}</button>
           </div>
@@ -975,6 +1066,7 @@ export default function Home() {
         <nav className="an-mobile-nav" aria-label="Sections">          <button type="button" className={`an-nav-item ${activeTab === "workspace" ? "active" : ""}`} onClick={() => setActiveTab("workspace")} aria-current={activeTab === "workspace" ? "page" : undefined}><NavIcon name="layout"/><span>Workspace</span>{activeTab === "workspace" && <span className="an-nav-indicator"/>}</button>
           <button type="button" className={`an-nav-item ${activeTab === "patterns" ? "active" : ""}`} onClick={() => setActiveTab("patterns")} aria-current={activeTab === "patterns" ? "page" : undefined}><NavIcon name="grid"/><span>Patterns</span>{activeTab === "patterns" && <span className="an-nav-indicator"/>}</button>
           <button type="button" className={`an-nav-item ${activeTab === "files" ? "active" : ""}`} onClick={() => setActiveTab("files")} aria-current={activeTab === "files" ? "page" : undefined}><NavIcon name="file"/><span>CAD Files</span>{activeTab === "files" && <span className="an-nav-indicator"/>}</button>
+          <button type="button" className={`an-nav-item ${activeTab === "materials" ? "active" : ""}`} onClick={() => setActiveTab("materials")} aria-current={activeTab === "materials" ? "page" : undefined}><NavIcon name="layers"/><span>Materials</span>{activeTab === "materials" && <span className="an-nav-indicator"/>}</button>
           <button type="button" className={`an-nav-item ${activeTab === "optimization" ? "active" : ""}`} onClick={() => setActiveTab("optimization")} aria-current={activeTab === "optimization" ? "page" : undefined}><NavIcon name="spark"/><span>Optimization</span>{activeTab === "optimization" && <span className="an-nav-indicator"/>}</button>
           <button type="button" className={`an-nav-item ${activeTab === "validation" ? "active" : ""}`} onClick={() => setActiveTab("validation")} aria-current={activeTab === "validation" ? "page" : undefined}><NavIcon name="shield"/><span>Validation</span>{activeTab === "validation" && <span className="an-nav-indicator"/>}</button>
           <button type="button" className={`an-nav-item ${activeTab === "exports" ? "active" : ""}`} onClick={() => setActiveTab("exports")} aria-current={activeTab === "exports" ? "page" : undefined}><NavIcon name="download"/><span>Exports</span>{activeTab === "exports" && <span className="an-nav-indicator"/>}</button></nav>
@@ -1015,11 +1107,11 @@ export default function Home() {
             <p className="mb-5 text-xs leading-5 text-slate-400">{preset === "imported" ? "Imported DXF outer contour preview. Fold and grainline data need source CAD validation." : PRESETS[preset].description}</p>
 
             <label htmlFor="width" className="mb-2 block text-xs text-slate-400">Fabric width (mm)</label>
-            <input id="width" type="number" min={1} value={fabricWidth} onChange={(e) => { setFabricWidth(Number(e.target.value)); setResult(null); setComparison(null); setBenchmark(null); setRefinement(null); setPhase13Report(null); setSelectedTrial(null); }}
+            <input id="width" type="number" min={1} value={fabricWidth} onChange={(e) => { setFabricWidth(Number(e.target.value)); setMaterialPreview(null); setResult(null); setComparison(null); setBenchmark(null); setRefinement(null); setPhase13Report(null); setSelectedTrial(null); }}
               className="mb-5 w-full rounded-lg border border-white/10 bg-slate-800 px-3 py-3 text-sm outline-none focus:border-sky-500" />
 
             <label htmlFor="gap" className="mb-2 block text-xs text-slate-400">Minimum pattern gap (mm)</label>
-            <input id="gap" type="number" min={0} value={gap} onChange={(e) => { setGap(Number(e.target.value)); setResult(null); setComparison(null); setBenchmark(null); setRefinement(null); setPhase13Report(null); setSelectedTrial(null); }}
+            <input id="gap" type="number" min={0} value={gap} onChange={(e) => { setGap(Number(e.target.value)); setMaterialPreview(null); setResult(null); setComparison(null); setBenchmark(null); setRefinement(null); setPhase13Report(null); setSelectedTrial(null); }}
               className="mb-5 w-full rounded-lg border border-white/10 bg-slate-800 px-3 py-3 text-sm outline-none focus:border-sky-500" />
 
             <label htmlFor="strategy" className="mb-2 block text-xs text-slate-400">Search strategy</label>
@@ -1395,6 +1487,52 @@ export default function Home() {
 
             </div>
             <aside className="an-pattern-summary"><span className="an-overline">CURRENT SELECTION</span><h3>{pieceCount} pieces</h3><p>{patterns.length} distinct pattern types</p><div className="an-summary-rule"/><p>Fabric width <strong>{fabricWidth} mm</strong></p><p>Minimum gap <strong>{gap} mm</strong></p><button type="button" className="an-primary-action w-full justify-center" onClick={() => setActiveTab("workspace")}>Open workspace <span aria-hidden="true">→</span></button></aside>
+          </div>}
+          {activeTab === "materials" && <div className="an-page-grid">
+            <div className="an-internal-scroll space-y-4">
+              <section className="an-review-card an-material-card">
+                <div className="an-section-heading"><div><span className="an-overline">PHASE 15 · SOURCE LABELS</span><h2>Material mapping review</h2></div><NavIcon name="layers"/></div>
+                <p className="an-intro-text">Read source material codes without guessing what they mean. Ask a CAD operator to confirm which codes belong to the same fabric group before generating separate diagnostic markers.</p>
+                {!sourceFile && <div className="an-info-note"><strong>Import a DXF first</strong><p>Use CAD Files to upload the original DXF and confirm its units.</p><button className="an-inline-link" onClick={()=>setActiveTab("files")}>Open CAD Files →</button></div>}
+                <button className="an-primary-action w-full justify-center mt-4" disabled={!sourceFile || materialLoading} onClick={runMaterialReview}>{materialLoading ? "Processing…" : "Inspect material labels"}</button>
+                {materialReview && <>
+                  <div className="an-info-note mt-4"><strong>{materialReview.pattern_count} candidate patterns</strong><p>Source units: {materialReview.source_units}</p><p>Independent CAD measurement: {materialReview.reference_check.status}</p></div>
+                  <p className="an-material-alert">Codes such as S and P are unverified TEXT from the CAD file — they are not automatically authenticated fabric types.</p>
+                  <div className="an-material-labels">
+                    {materialReview.source_material_labels.map(label => {
+                      const entry = materialAssignments.find(a=>a.source_label===label.label);
+                      return <div className="an-material-row" key={label.label}>
+                        <div><strong>Source code: {label.label}</strong><p>{label.patterns} pattern types · {label.labelled_quantity} labelled copies</p></div>
+                        <label>Confirmed fabric group name
+                          <input type="text" maxLength={40} placeholder="E.g. Main fabric" value={entry?.group_id??""} onChange={e=>{setMaterialPreview(null);setMaterialAssignments(items=>items.map(a=>a.source_label===label.label?{...a,group_id:e.target.value,operator_confirmed:false}:a));}} />
+                        </label>
+                        <label className="an-material-confirm"><input type="checkbox" checked={!!entry?.operator_confirmed} onChange={e=>{setMaterialPreview(null);setMaterialAssignments(items=>items.map(a=>a.source_label===label.label?{...a,operator_confirmed:e.target.checked}:a));}}/> Mapping checked against original CAD / by a CAD operator</label>
+                      </div>;
+                    })}
+                  </div>
+                  <label className="an-material-width">Optional per-group widths (mm):
+                    {[...new Set(materialAssignments.map(a=>a.group_id.trim()).filter(Boolean))].map(id=><span key={id} className="an-material-width-field"><span>{id}</span><input type="number" min="1" max="20000" placeholder={`Default ${fabricWidth}`} value={materialWidths[id]??""} onChange={e=>{setMaterialPreview(null);setMaterialWidths(old=>({...old,[id]:e.target.value}));}}/></span>)}
+                  </label>
+                  <button className="an-primary-action w-full justify-center mt-4" disabled={materialLoading || !materialAssignments.filter(a=>patterns.some(p=>(p.source_material?.trim()||"UNLABELED")===a.source_label)).every(a=>a.operator_confirmed && !!a.group_id.trim())} onClick={generateMaterialPreviews}>Generate separated marker previews</button>
+                </>}
+                {materialError && <p className="an-global-error mt-3" role="alert">{materialError}</p>}
+                <p className="an-material-alert mt-4">NOT FOR CUTTING. Unverified grainline, fold, seam, notch, material meaning and CAD units can affect factory suitability.</p>
+              </section>
+            </div>
+            <div className="an-internal-scroll space-y-4">
+              <div className="an-section-page-title"><span className="an-overline">DIAGNOSTIC MARKER RESULTS</span><h2>Separated fabric previews</h2><p>Each confirmed group is optimized and audited separately. There is no combined utilization across different fabrics.</p></div>
+              {!materialPreview && <div className="an-empty-state">Import a DXF, review its material codes and confirm group assignments to see separate preview layouts.</div>}
+              {materialPreview && <>
+                <div className="an-material-kpi-row">{materialPreview.groups.map(g=><button type="button" key={g.group_id} className={`an-material-kpi ${selectedMaterialGroup===g.group_id?"selected":""}`} onClick={()=>setSelectedMaterialGroup(g.group_id)}><strong>{g.group_id}</strong><span>{g.instances} pieces · {g.utilization_percent.toFixed(2)}% utilization</span><small>{g.fabric_length_mm.toFixed(2)} mm length</small></button>)}</div>
+                {materialPreview.groups.filter(g=>g.group_id===selectedMaterialGroup).map(g=><section key={g.group_id} className="an-review-card an-material-preview">
+                  <div className="an-section-heading"><div><span className="an-overline">FABRIC GROUP · {g.group_id}</span><h2>{g.instances} audited pattern copies</h2></div><span className="an-canvas-flag">NOT FOR CUTTING</span></div>
+                  <div className="an-material-stats"><span>Fabric width: {g.fabric_width_mm} mm</span><span>Length: {g.fabric_length_mm.toFixed(2)} mm</span><span>Gap audit: {g.geometry_audit.minimum_clearance_mm?.toFixed(3)??"—"} mm</span></div>
+                  <svg viewBox={`0 0 ${g.fabric_width_mm} ${Math.max(g.fabric_length_mm,1)}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label={`${g.group_id} diagnostic marker layout`} className="an-material-svg" xmlns="http://www.w3.org/2000/svg"><rect width={g.fabric_width_mm} height={Math.max(g.fabric_length_mm,1)} fill="#19283c"/>{g.layout.placed_patterns.map((p,i)=><polygon key={`${p.name}-${p.instance}-${i}`} points={p.points.map(([x,y])=>`${x},${y}`).join(" ")} fill={COLORS[i%COLORS.length]} stroke="#fff" strokeWidth={0.5}><title>{p.name} copy {p.instance}</title></polygon>)}</svg>
+                  <p className="an-intro-text">Source codes: {g.source_material_labels.join(", ")} · Geometry audit: {g.geometry_audit.passed?"PASS":"FAIL"} · No manufacturing approval</p>
+                </section>)}
+                <button className="an-outline-action" onClick={downloadMaterialReview}><NavIcon name="download"/> Download Phase 15 JSON report</button>
+              </>}
+            </div>
           </div>}
           {activeTab === "optimization" && <div className="an-page-grid">
             <div className="an-internal-scroll"><section className="rounded-2xl border border-white/10 bg-slate-900 p-5">
